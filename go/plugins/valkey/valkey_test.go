@@ -19,6 +19,7 @@ package valkey
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"math"
@@ -116,6 +117,61 @@ func TestFloat32SliceToBytesEmpty(t *testing.T) {
 	result := float32SliceToBytes(nil)
 	if len(result) != 0 {
 		t.Errorf("expected empty slice, got %d bytes", len(result))
+	}
+}
+
+func TestValidateFilter(t *testing.T) {
+	for _, tc := range []struct {
+		filter  string
+		wantErr bool
+	}{
+		{"@price:[100 200]", false},
+		{"@tag:{foo}", false},
+		{"*", false},
+		{"", false},
+		{"@field:[0 10];DROP", true},
+		{"@a|@b", true},
+		{"val`cmd", true},
+		{"$var", true},
+		{`back\slash`, true},
+	} {
+		err := validateFilter(tc.filter)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("validateFilter(%q): got err=%v, wantErr=%v", tc.filter, err, tc.wantErr)
+		}
+	}
+}
+
+func TestFieldToString(t *testing.T) {
+	if got := fieldToString("hello"); got != "hello" {
+		t.Errorf("string: got %q", got)
+	}
+	if got := fieldToString([]byte("world")); got != "world" {
+		t.Errorf("[]byte: got %q", got)
+	}
+	if got := fieldToString(42); got != "" {
+		t.Errorf("unknown type: want empty, got %q", got)
+	}
+}
+
+func TestMetadataValueToString(t *testing.T) {
+	for _, tc := range []struct {
+		val       any
+		fieldType MetadataFieldType
+		want      string
+	}{
+		{float64(3.14), MetadataFieldTypeNumeric, "3.14"},
+		{float32(1.5), MetadataFieldTypeNumeric, "1.5"},
+		{int(42), MetadataFieldTypeNumeric, "42"},
+		{int64(99), MetadataFieldTypeNumeric, "99"},
+		{json.Number("2.718"), MetadataFieldTypeNumeric, "2.718"},
+		{"label", MetadataFieldTypeTag, "label"},
+		{float64(7.0), MetadataFieldTypeTag, "7"},
+	} {
+		got := metadataValueToString(tc.val, tc.fieldType)
+		if got != tc.want {
+			t.Errorf("metadataValueToString(%v, %v): got %q, want %q", tc.val, tc.fieldType, got, tc.want)
+		}
 	}
 }
 

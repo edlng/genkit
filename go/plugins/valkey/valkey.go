@@ -311,10 +311,11 @@ func Index(ctx context.Context, docs []*ai.Document, ds *Docstore) error {
 		}
 
 		// Store declared metadata keys as top-level HASH fields for filtering.
+		// Numeric fields preserve numeric formatting; TAG fields use %v.
 		if doc.Metadata != nil {
 			for _, mf := range ds.MetadataFields {
 				if val, ok := doc.Metadata[mf.Name]; ok {
-					fields[mf.Name] = fmt.Sprintf("%v", val)
+					fields[mf.Name] = metadataValueToString(val, mf.Type)
 				}
 			}
 		}
@@ -341,6 +342,12 @@ func (ds *Docstore) Retrieve(ctx context.Context, req *ai.RetrieverRequest) (*ai
 			k = ropt.K
 		}
 		filter = ropt.Filter
+	}
+
+	if filter != "" {
+		if err := validateFilter(filter); err != nil {
+			return nil, err
+		}
 	}
 
 	ereq := &ai.EmbedRequest{
@@ -384,11 +391,11 @@ func (ds *Docstore) Retrieve(ctx context.Context, req *ai.RetrieverRequest) (*ai
 
 	docs := make([]*ai.Document, 0, len(result.Documents))
 	for _, doc := range result.Documents {
-		content, _ := doc.Fields["_content"].(string)
+		content := fieldToString(doc.Fields["_content"])
 		if content == "" {
 			continue
 		}
-		metadataStr, _ := doc.Fields["_metadata"].(string)
+		metadataStr := fieldToString(doc.Fields["_metadata"])
 
 		var meta map[string]any
 		if metadataStr != "" && metadataStr != "{}" {
@@ -417,11 +424,59 @@ func float32SliceToBytes(v []float32) []byte {
 }
 
 // docID returns the ID to use for a Document.
-// Go's encoding/json sorts map keys, so this produces deterministic output.
+// Go's encoding/json sorts map[string]* keys; struct fields follow declaration
+// order — both are deterministic, so the resulting hash is stable.
 func docID(doc *ai.Document) (string, error) {
 	b, err := json.Marshal(doc)
 	if err != nil {
 		return "", fmt.Errorf("valkey: error marshaling document: %v", err)
 	}
 	return fmt.Sprintf("%02x", md5.Sum(b)), nil
+}
+
+// fieldToString extracts a string from a field value that may be returned as
+// string or []byte depending on the Valkey client version.
+func fieldToString(v any) string {
+	switch val := v.(type) {
+	case string:
+		return val
+	case []byte:
+		return string(val)
+	default:
+		return ""
+	}
+}
+
+// filterDisallowedChars contains characters that could alter FT.SEARCH query
+// semantics if injected into a filter expression.
+const filterDisallowedChars = ";|`$\\"
+
+// validateFilter checks that a filter expression does not contain characters
+// that could break out of the filter context.
+func validateFilter(filter string) error {
+	if strings.ContainsAny(filter, filterDisallowedChars) {
+		return errors.New("valkey: filter expression contains disallowed characters; do not pass untrusted user input as a filter")
+	}
+	return nil
+}
+
+// metadataValueToString converts a metadata value to a string suitable for
+// storage in a Valkey HASH field. Numeric fields are formatted to preserve
+// parseability as 64-bit floats.
+func metadataValueToString(val any, fieldType MetadataFieldType) string {
+	if fieldType == MetadataFieldTypeNumeric {
+		switch v := val.(type) {
+		case float64:
+			return fmt.Sprintf("%g", v)
+		case float32:
+			return fmt.Sprintf("%g", v)
+		case int:
+			return fmt.Sprintf("%d", v)
+		case int64:
+			return fmt.Sprintf("%d", v)
+		case json.Number:
+			return v.String()
+		}
+	}
+	return fmt.Sprintf("%v", val)
 }

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import struct
 from dataclasses import dataclass, field
 from enum import Enum
@@ -144,13 +145,21 @@ class Valkey(Plugin):
         """Connect to Valkey and ensure indexes exist."""
         actions: list[Action] = []
 
+        # Reuse clients for configs sharing the same host:port.
+        client_cache: dict[tuple[str, int], GlideClient] = {}
+
         for cfg in self.configs:
             prefix = cfg.prefix or cfg.index_name
-            client = await GlideClient.create(
-                GlideClientConfiguration(
-                    addresses=[NodeAddress(cfg.host, cfg.port)]
+            cache_key = (cfg.host, cfg.port)
+            if cache_key in client_cache:
+                client = client_cache[cache_key]
+            else:
+                client = await GlideClient.create(
+                    GlideClientConfiguration(
+                        addresses=[NodeAddress(cfg.host, cfg.port)]
+                    )
                 )
-            )
+                client_cache[cache_key] = client
             self._clients[cfg.index_name] = client
 
             await _ensure_index(
@@ -178,8 +187,11 @@ class Valkey(Plugin):
 
     async def close(self) -> None:
         """Close all Valkey client connections."""
+        seen: set[int] = set()
         for client in self._clients.values():
-            await client.close()
+            if id(client) not in seen:
+                seen.add(id(client))
+                await client.close()
         self._clients.clear()
 
     async def resolve(self, action_type: ActionKind, name: str) -> Action | None:
@@ -250,11 +262,19 @@ class Valkey(Plugin):
                 }
 
                 # Store declared metadata fields as top-level HASH fields for filtering.
+                # Numeric fields preserve numeric formatting for Valkey indexing.
                 if doc.metadata and cfg.metadata_fields:
                     for mf in cfg.metadata_fields:
                         val = doc.metadata.get(mf.name)
                         if val is not None:
-                            fields[mf.name] = str(val)
+                            if mf.field_type == MetadataFieldType.NUMERIC and isinstance(val, (int, float)):
+                                if isinstance(val, float) and (val != val or val == float('inf') or val == float('-inf')):
+                                    raise ValueError(
+                                        f'valkey: NUMERIC field {mf.name!r} received non-finite float {val!r}'
+                                    )
+                                fields[mf.name] = str(val)
+                            else:
+                                fields[mf.name] = str(val)
 
                 await client.hset(key, fields)
 
@@ -272,6 +292,9 @@ class Valkey(Plugin):
             if req.options and isinstance(req.options, dict):
                 k = req.options.get('k', 10)
                 filter_expr = req.options.get('filter', None)
+
+            if filter_expr is not None:
+                _validate_filter(filter_expr)
 
             registry = plugin._registry
             if registry is None:
@@ -390,3 +413,19 @@ async def _ensure_index(
         if 'already exists' in str(e).lower():
             return
         raise
+
+
+_FILTER_DISALLOWED_PATTERN = re.compile(r'[;|`$\\]')
+
+
+def _validate_filter(filter_expr: str) -> None:
+    """Validate a filter expression to prevent query injection.
+
+    Raises ValueError if the expression contains characters that could
+    alter FT.SEARCH query semantics.
+    """
+    if _FILTER_DISALLOWED_PATTERN.search(filter_expr):
+        raise ValueError(
+            'valkey: filter expression contains disallowed characters. '
+            'Do not pass untrusted user input as a filter.'
+        )

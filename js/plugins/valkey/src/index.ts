@@ -24,6 +24,7 @@ import {
   type TextField,
   type VectorField,
 } from '@valkey/valkey-glide';
+import { createHash } from 'crypto';
 import {
   Document,
   indexerRef,
@@ -34,7 +35,6 @@ import {
 } from 'genkit';
 import { genkitPlugin, type GenkitPlugin } from 'genkit/plugin';
 import { CommonRetrieverOptionsSchema } from 'genkit/retriever';
-import { Md5 } from 'ts-md5';
 
 /** Distance metric for the HNSW index. */
 export type ValkeyDistanceMetric = 'COSINE' | 'L2' | 'IP';
@@ -245,7 +245,7 @@ function configureValkeyIndexer<EmbedderCustomOptions extends z.ZodTypeAny>(
         for (let j = 0; j < docEmbeddings.length; j++) {
           const embedding = docEmbeddings[j].embedding;
           const embeddingDoc = embeddingDocs[j];
-          const id = Md5.hashStr(JSON.stringify(embeddingDoc));
+          const id = stableDocId(embeddingDoc);
           const embeddingBuffer = Buffer.from(
             new Float32Array(embedding).buffer
           );
@@ -264,11 +264,22 @@ function configureValkeyIndexer<EmbedderCustomOptions extends z.ZodTypeAny>(
           ];
 
           // Store declared metadata keys as top-level HASH fields for filtering.
+          // Numeric fields are stored as-is to preserve Valkey numeric indexing;
+          // TAG fields are converted to strings.
           if (embeddingDoc.metadata) {
             for (const mf of metadataFields) {
               const val = (embeddingDoc.metadata as Record<string, unknown>)[mf.name];
               if (val !== undefined && val !== null) {
-                fields.push({ field: mf.name, value: String(val) });
+                if (mf.type === 'NUMERIC') {
+                  if (typeof val !== 'number') {
+                    throw new Error(
+                      `valkey: NUMERIC metadata field '${mf.name}' received non-number value: ${typeof val}`
+                    );
+                  }
+                  fields.push({ field: mf.name, value: val.toString() });
+                } else {
+                  fields.push({ field: mf.name, value: String(val) });
+                }
               }
             }
           }
@@ -314,6 +325,10 @@ function configureValkeyRetriever<EmbedderCustomOptions extends z.ZodTypeAny>(
       const queryBuffer = Buffer.from(new Float32Array(queryVector).buffer);
       const k = options?.k ?? 10;
       const filter = options?.filter;
+
+      if (filter !== undefined) {
+        validateFilterExpression(filter);
+      }
 
       // Build KNN query with optional pre-filter expression.
       const knnQuery = filter
@@ -388,5 +403,48 @@ function safeJsonParse(value: string): Record<string, unknown> | undefined {
     return undefined;
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * Produces a deterministic document ID by recursively sorting all object keys
+ * before serializing and hashing with MD5. Using an array as the JSON.stringify
+ * replacer would drop nested object properties (they must appear in the allowlist),
+ * so we build the sorted JSON string manually instead.
+ */
+function stableDocId(doc: { data: string; metadata?: unknown; dataType?: string }): string {
+  const sortedStringify = (v: unknown): string => {
+    if (typeof v !== 'object' || v === null) return JSON.stringify(v);
+    if (Array.isArray(v)) return '[' + v.map(sortedStringify).join(',') + ']';
+    return (
+      '{' +
+      Object.keys(v as object)
+        .sort()
+        .map((k) => JSON.stringify(k) + ':' + sortedStringify((v as Record<string, unknown>)[k]))
+        .join(',') +
+      '}'
+    );
+  };
+  return createHash('md5').update(sortedStringify(doc)).digest('hex');
+}
+
+/**
+ * Characters that could alter FT.SEARCH query semantics if injected.
+ * This is a conservative allowlist approach: reject expressions containing
+ * unbalanced brackets, pipes, or semicolons that could break out of the
+ * filter context.
+ */
+const FILTER_DISALLOWED_PATTERN = /[;|`$\\]/;
+
+/**
+ * Validates a filter expression to prevent query injection.
+ * Throws if the expression contains characters that could alter query semantics.
+ */
+function validateFilterExpression(filter: string): void {
+  if (FILTER_DISALLOWED_PATTERN.test(filter)) {
+    throw new Error(
+      'valkey: filter expression contains disallowed characters. ' +
+      'Do not pass untrusted user input as a filter.'
+    );
   }
 }

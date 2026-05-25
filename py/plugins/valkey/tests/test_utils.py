@@ -18,8 +18,14 @@
 
 import struct
 
+import pytest
+
 from genkit import Document
-from genkit.plugins.valkey.plugin import _doc_id, _float32_to_bytes
+from genkit.plugins.valkey.plugin import (
+    _doc_id,
+    _float32_to_bytes,
+    _validate_filter,
+)
 
 
 def test_float32_to_bytes():
@@ -42,3 +48,16 @@ def test_doc_id_deterministic():
     assert _doc_id(d1) == _doc_id(d2)
     assert _doc_id(d1) != _doc_id(d3)
     assert len(_doc_id(d1)) == 32  # MD5 hex
+
+
+def test_validate_filter_allows_valid_expressions():
+    _validate_filter('@price:[100 200]')
+    _validate_filter('@tag:{foo}')
+    _validate_filter('*')
+    _validate_filter('')
+
+
+@pytest.mark.parametrize('char', [';', '|', '`', '$', '\\'])
+def test_validate_filter_blocks_disallowed_chars(char):
+    with pytest.raises(ValueError, match='disallowed characters'):
+        _validate_filter(f'@field:[0 10]{char}inject')

@@ -35,6 +35,7 @@ members = [
     "prompts",
     "tool-interrupts",
     "tracing",
+    "valkey-sample",
     "vertexai-imagen",
 ]
 overrides = [{ name = "werkzeug", specifier = ">=3.1.6" }]
@@ -6173,6 +6174,23 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/29/ab/5ca8d31515601e0cff846a4e62af6fbc95a70d274ca1db4cf6a49c6ee297/valkey_glide-2.4.0-pp311-pypy311_pp73-macosx_11_0_arm64.whl", hash = "sha256:b23c5d858cae517b1643c4cbefa35745afd5d9251f11fd290a6ae285b22748ed", size = 6949012, upload-time = "2026-05-20T21:58:21.095Z" },
     { url = "https://files.pythonhosted.org/packages/94/e6/b04246bca25e32fed0d4b4f6156bd61c735d7f9d84cb5adb7430bc73c595/valkey_glide-2.4.0-pp311-pypy311_pp73-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:c878f097b99e4034b32db92a390ea25a765adf7ea9c6cd3a5949010c892f462a", size = 7273352, upload-time = "2026-05-20T21:58:22.852Z" },
     { url = "https://files.pythonhosted.org/packages/46/0c/9a20f8becba1cb721311da3c8dabfdab6ad6afd3e9041503288227081083/valkey_glide-2.4.0-pp311-pypy311_pp73-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:565a49e57492ce5ade793ecfdf0a8b4444f1d222c65036623a488ce1c80b98bf", size = 7698497, upload-time = "2026-05-20T21:58:24.763Z" },
+]
+
+[[package]]
+name = "valkey-sample"
+version = "0.1.0"
+source = { editable = "samples/valkey" }
+dependencies = [
+    { name = "genkit" },
+    { name = "genkit-plugin-ollama" },
+    { name = "genkit-plugin-valkey" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "genkit", editable = "packages/genkit" },
+    { name = "genkit-plugin-ollama", editable = "plugins/ollama" },
+    { name = "genkit-plugin-valkey", editable = "plugins/valkey" },
 ]
 
 [[package]]

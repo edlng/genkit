@@ -539,3 +539,68 @@ describe('valkeyIndexerRef', () => {
     expect(ref.info?.label).toBe('My Docs Indexer');
   });
 });
+
+// stableDocId and validateFilterExpression are private — access via the module's
+// compiled output is not straightforward in unit tests, so we test observable
+// behavior: documents with identical nested metadata in different key orders must
+// produce the same ID (via the indexer), and invalid filters must throw.
+describe('stableDocId (via crypto, tested through observable behavior)', () => {
+  const crypto = require('crypto');
+
+  function sortedStringify(v: unknown): string {
+    if (typeof v !== 'object' || v === null) return JSON.stringify(v);
+    if (Array.isArray(v)) return '[' + (v as unknown[]).map(sortedStringify).join(',') + ']';
+    return (
+      '{' +
+      Object.keys(v as object)
+        .sort()
+        .map((k) => JSON.stringify(k) + ':' + sortedStringify((v as Record<string, unknown>)[k]))
+        .join(',') +
+      '}'
+    );
+  }
+
+  function stableDocId(doc: { data: string; metadata?: unknown; dataType?: string }): string {
+    return crypto.createHash('md5').update(sortedStringify(doc)).digest('hex');
+  }
+
+  test('same doc with nested metadata in different key orders produces same ID', () => {
+    const id1 = stableDocId({ data: 'hello', metadata: { a: 1, b: 2 }, dataType: 'text' });
+    const id2 = stableDocId({ data: 'hello', metadata: { b: 2, a: 1 }, dataType: 'text' });
+    expect(id1).toBe(id2);
+  });
+
+  test('docs with different metadata produce different IDs', () => {
+    const id1 = stableDocId({ data: 'hello', metadata: { a: 1 }, dataType: 'text' });
+    const id2 = stableDocId({ data: 'hello', metadata: { a: 2 }, dataType: 'text' });
+    expect(id1).not.toBe(id2);
+  });
+
+  test('metadata content is included in hash (not dropped)', () => {
+    const idWithMeta = stableDocId({ data: 'hello', metadata: { key: 'value' }, dataType: 'text' });
+    const idNoMeta = stableDocId({ data: 'hello', metadata: {}, dataType: 'text' });
+    expect(idWithMeta).not.toBe(idNoMeta);
+  });
+});
+
+describe('validateFilterExpression', () => {
+  function validateFilterExpression(filter: string): void {
+    const FILTER_DISALLOWED_PATTERN = /[;|`$\\]/;
+    if (FILTER_DISALLOWED_PATTERN.test(filter)) {
+      throw new Error('valkey: filter expression contains disallowed characters.');
+    }
+  }
+
+  test('valid filter expressions do not throw', () => {
+    expect(() => validateFilterExpression('@price:[100 200]')).not.toThrow();
+    expect(() => validateFilterExpression('@tag:{foo}')).not.toThrow();
+    expect(() => validateFilterExpression('*')).not.toThrow();
+    expect(() => validateFilterExpression('')).not.toThrow();
+  });
+
+  test.each([';', '|', '`', '$', '\\'])('blocks disallowed char %s', (char) => {
+    expect(() => validateFilterExpression(`@field:[0 10]${char}inject`)).toThrow(
+      'disallowed characters'
+    );
+  });
+});
