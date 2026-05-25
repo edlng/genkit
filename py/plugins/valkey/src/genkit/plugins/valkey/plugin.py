@@ -194,6 +194,22 @@ class Valkey(Plugin):
                 await client.close()
         self._clients.clear()
 
+    async def _resolve_embedder(self, cfg: ValkeyConfig) -> Action:
+        """Resolve the embedder action from the registry.
+
+        Raises RuntimeError if the plugin is not registered, or ValueError
+        if the embedder cannot be found.
+        """
+        if self._registry is None:
+            raise RuntimeError(
+                'Valkey plugin not registered with a Genkit registry; '
+                'pass it to Genkit(plugins=[...]) before use'
+            )
+        action = await self._registry.resolve_embedder(cfg.embedder)
+        if action is None:
+            raise ValueError(f'Embedder "{cfg.embedder}" not found')
+        return action
+
     async def resolve(self, action_type: ActionKind, name: str) -> Action | None:
         """Resolve is not needed — all actions are pre-registered in init."""
         return None
@@ -221,15 +237,7 @@ class Valkey(Plugin):
         plugin = self
 
         async def index_fn(req: IndexerRequest) -> IndexerResponse:
-            registry = plugin._registry
-            if registry is None:
-                raise RuntimeError(
-                    'Valkey plugin not registered with a Genkit registry; '
-                    'pass it to Genkit(plugins=[...]) before indexing'
-                )
-            embedder_action = await registry.resolve_embedder(cfg.embedder)
-            if embedder_action is None:
-                raise ValueError(f'Embedder "{cfg.embedder}" not found')
+            embedder_action = await plugin._resolve_embedder(cfg)
 
             embed_response = (
                 await embedder_action.run(
@@ -293,18 +301,13 @@ class Valkey(Plugin):
                 k = req.options.get('k', 10)
                 filter_expr = req.options.get('filter', None)
 
+            if k > 1000:
+                raise ValueError('valkey: k must not exceed 1000')
+
             if filter_expr is not None:
                 _validate_filter(filter_expr)
 
-            registry = plugin._registry
-            if registry is None:
-                raise RuntimeError(
-                    'Valkey plugin not registered with a Genkit registry; '
-                    'pass it to Genkit(plugins=[...]) before retrieving'
-                )
-            embedder_action = await registry.resolve_embedder(cfg.embedder)
-            if embedder_action is None:
-                raise ValueError(f'Embedder "{cfg.embedder}" not found')
+            embedder_action = await plugin._resolve_embedder(cfg)
 
             embed_response = (
                 await embedder_action.run(
@@ -415,14 +418,14 @@ async def _ensure_index(
         raise
 
 
-_FILTER_DISALLOWED_PATTERN = re.compile(r'[;|`$\\]')
+_FILTER_DISALLOWED_PATTERN = re.compile(r'[;|`$\\]|=>')
 
 
 def _validate_filter(filter_expr: str) -> None:
     """Validate a filter expression to prevent query injection.
 
-    Raises ValueError if the expression contains characters that could
-    alter FT.SEARCH query semantics.
+    Raises ValueError if the expression contains characters or sequences that
+    could alter FT.SEARCH query semantics.
     """
     if _FILTER_DISALLOWED_PATTERN.search(filter_expr):
         raise ValueError(

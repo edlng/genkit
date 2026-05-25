@@ -44,10 +44,12 @@ jest.mock('@valkey/valkey-glide', () => ({
 }));
 
 // Import after mocks are set up
-import { valkeyPlugin, valkeyIndexerRef, valkeyRetrieverRef } from '../src';
+import { valkeyPlugin, valkeyIndexerRef, valkeyRetrieverRef, stableDocId, validateFilterExpression } from '../src';
 
 // Mock Genkit instance
 const mockEmbed = jest.fn<any>();
+const mockEmbedderAction = jest.fn<any>();
+const mockLookupAction = jest.fn<any>().mockResolvedValue(mockEmbedderAction);
 const mockDefineRetriever = jest.fn<any>(
   (config: any, handler: any) => ({
     config,
@@ -65,6 +67,9 @@ const mockGenkit: Genkit = {
   embed: mockEmbed,
   defineRetriever: mockDefineRetriever,
   defineIndexer: mockDefineIndexer,
+  registry: {
+    lookupAction: mockLookupAction,
+  },
 } as unknown as Genkit;
 
 const mockEmbedder: EmbedderArgument<z.ZodTypeAny> = {
@@ -90,7 +95,7 @@ describe('valkeyPlugin', () => {
     ]);
 
     // genkitPlugin returns a function that takes Genkit and returns {initializer}
-    const pluginInstance = (plugin as any)(mockGenkit);
+    const pluginInstance = (plugin.plugin as any)(mockGenkit);
     await pluginInstance.initializer();
 
     expect(mockGlideFtCreate).toHaveBeenCalledWith(
@@ -109,6 +114,7 @@ describe('valkeyPlugin', () => {
         }),
         expect.objectContaining({ type: 'TEXT', name: '_content' }),
         expect.objectContaining({ type: 'TEXT', name: '_metadata' }),
+        expect.objectContaining({ type: 'TEXT', name: '_dataType' }),
       ]),
       expect.objectContaining({
         dataType: 'HASH',
@@ -129,7 +135,7 @@ describe('valkeyPlugin', () => {
       },
     ]);
 
-    const pluginInstance = (plugin as any)(mockGenkit);
+    const pluginInstance = (plugin.plugin as any)(mockGenkit);
     await expect(pluginInstance.initializer()).resolves.not.toThrow();
   });
 
@@ -145,7 +151,7 @@ describe('valkeyPlugin', () => {
       },
     ]);
 
-    const pluginInstance = (plugin as any)(mockGenkit);
+    const pluginInstance = (plugin.plugin as any)(mockGenkit);
     await expect(pluginInstance.initializer()).rejects.toThrow('Connection refused');
   });
 
@@ -159,7 +165,7 @@ describe('valkeyPlugin', () => {
       },
     ]);
 
-    const pluginInstance = (plugin as any)(mockGenkit);
+    const pluginInstance = (plugin.plugin as any)(mockGenkit);
     await pluginInstance.initializer();
 
     expect(mockDefineIndexer).toHaveBeenCalledWith(
@@ -183,7 +189,7 @@ describe('valkeyPlugin', () => {
       },
     ]);
 
-    const pluginInstance = (plugin as any)(mockGenkit);
+    const pluginInstance = (plugin.plugin as any)(mockGenkit);
     await pluginInstance.initializer();
 
     expect(mockGlideFtCreate).toHaveBeenCalledWith(
@@ -213,14 +219,16 @@ describe('valkeyIndexer', () => {
       },
     ]);
 
-    const pluginInstance = (plugin as any)(mockGenkit);
+    const pluginInstance = (plugin.plugin as any)(mockGenkit);
     await pluginInstance.initializer();
 
     indexerHandler = mockDefineIndexer.mock.calls[0][1] as any;
   });
 
   test('should embed documents and store as hashes', async () => {
-    mockEmbed.mockResolvedValue([{ embedding: [0.1, 0.2, 0.3] }]);
+    mockEmbedderAction.mockResolvedValue({
+      embeddings: [{ embedding: [0.1, 0.2, 0.3] }],
+    });
 
     const doc = new Document({
       content: [{ text: 'Hello world' }],
@@ -229,8 +237,10 @@ describe('valkeyIndexer', () => {
 
     await indexerHandler([doc]);
 
-    expect(mockEmbed).toHaveBeenCalledWith(
-      expect.objectContaining({ embedder: mockEmbedder, content: doc })
+    expect(mockEmbedderAction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        input: expect.any(Array),
+      })
     );
     expect(mockHset).toHaveBeenCalledWith(
       expect.stringMatching(/^test-index:/),
@@ -245,7 +255,9 @@ describe('valkeyIndexer', () => {
 
   test('should convert embedding to Float32 buffer', async () => {
     const embedding = [1.0, 2.0, 3.0];
-    mockEmbed.mockResolvedValue([{ embedding }]);
+    mockEmbedderAction.mockResolvedValue({
+      embeddings: [{ embedding }],
+    });
 
     const doc = new Document({ content: [{ text: 'test' }] });
     await indexerHandler([doc]);
@@ -262,7 +274,9 @@ describe('valkeyIndexer', () => {
   });
 
   test('should serialize metadata as JSON', async () => {
-    mockEmbed.mockResolvedValue([{ embedding: [0.1, 0.2, 0.3] }]);
+    mockEmbedderAction.mockResolvedValue({
+      embeddings: [{ embedding: [0.1, 0.2, 0.3] }],
+    });
 
     const metadata = { page: 1, source: 'docs', nested: { key: 'value' } };
     const doc = new Document({
@@ -281,7 +295,13 @@ describe('valkeyIndexer', () => {
   });
 
   test('should handle multiple documents', async () => {
-    mockEmbed.mockResolvedValue([{ embedding: [0.1, 0.2, 0.3] }]);
+    mockEmbedderAction.mockResolvedValue({
+      embeddings: [
+        { embedding: [0.1, 0.2, 0.3] },
+        { embedding: [0.4, 0.5, 0.6] },
+        { embedding: [0.7, 0.8, 0.9] },
+      ],
+    });
 
     const docs = [
       new Document({ content: [{ text: 'doc1' }] }),
@@ -291,59 +311,9 @@ describe('valkeyIndexer', () => {
 
     await indexerHandler(docs);
 
-    expect(mockEmbed).toHaveBeenCalledTimes(3);
+    // Batched: single call to embedder with all docs
+    expect(mockEmbedderAction).toHaveBeenCalledTimes(1);
     expect(mockHset).toHaveBeenCalledTimes(3);
-  });
-
-  test('should use embedMany when available for batch embedding', async () => {
-    const mockEmbedMany = jest.fn<any>().mockResolvedValue([
-      { embedding: [1.0, 0.0, 0.0] },
-      { embedding: [0.0, 1.0, 0.0] },
-    ]);
-
-    // Create a Genkit mock with embedMany defined
-    const genkitWithEmbedMany: Genkit = {
-      embed: mockEmbed,
-      embedMany: mockEmbedMany,
-      defineRetriever: mockDefineRetriever,
-      defineIndexer: mockDefineIndexer,
-    } as unknown as Genkit;
-
-    jest.clearAllMocks();
-    mockGlideFtCreate.mockResolvedValue('OK');
-
-    const plugin = valkeyPlugin([
-      {
-        indexName: 'batch-index',
-        embedder: mockEmbedder,
-        dimension: 3,
-        clientConfig: { addresses: [{ host: 'localhost', port: 6379 }] },
-      },
-    ]);
-
-    const pluginInstance = (plugin as any)(genkitWithEmbedMany);
-    await pluginInstance.initializer();
-
-    const batchIndexerHandler = mockDefineIndexer.mock.calls[0][1] as any;
-
-    const docs = [
-      new Document({ content: [{ text: 'doc1' }] }),
-      new Document({ content: [{ text: 'doc2' }] }),
-    ];
-
-    await batchIndexerHandler(docs);
-
-    // embedMany should be called once with all docs
-    expect(mockEmbedMany).toHaveBeenCalledTimes(1);
-    expect(mockEmbedMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        embedder: mockEmbedder,
-        content: docs,
-      })
-    );
-    // embed should NOT be called (embedMany takes priority)
-    expect(mockEmbed).not.toHaveBeenCalled();
-    expect(mockHset).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -363,7 +333,7 @@ describe('valkeyRetriever', () => {
       },
     ]);
 
-    const pluginInstance = (plugin as any)(mockGenkit);
+    const pluginInstance = (plugin.plugin as any)(mockGenkit);
     await pluginInstance.initializer();
 
     retrieverHandler = mockDefineRetriever.mock.calls[0][1] as any;
@@ -540,30 +510,7 @@ describe('valkeyIndexerRef', () => {
   });
 });
 
-// stableDocId and validateFilterExpression are private — access via the module's
-// compiled output is not straightforward in unit tests, so we test observable
-// behavior: documents with identical nested metadata in different key orders must
-// produce the same ID (via the indexer), and invalid filters must throw.
-describe('stableDocId (via crypto, tested through observable behavior)', () => {
-  const crypto = require('crypto');
-
-  function sortedStringify(v: unknown): string {
-    if (typeof v !== 'object' || v === null) return JSON.stringify(v);
-    if (Array.isArray(v)) return '[' + (v as unknown[]).map(sortedStringify).join(',') + ']';
-    return (
-      '{' +
-      Object.keys(v as object)
-        .sort()
-        .map((k) => JSON.stringify(k) + ':' + sortedStringify((v as Record<string, unknown>)[k]))
-        .join(',') +
-      '}'
-    );
-  }
-
-  function stableDocId(doc: { data: string; metadata?: unknown; dataType?: string }): string {
-    return crypto.createHash('md5').update(sortedStringify(doc)).digest('hex');
-  }
-
+describe('stableDocId', () => {
   test('same doc with nested metadata in different key orders produces same ID', () => {
     const id1 = stableDocId({ data: 'hello', metadata: { a: 1, b: 2 }, dataType: 'text' });
     const id2 = stableDocId({ data: 'hello', metadata: { b: 2, a: 1 }, dataType: 'text' });
@@ -584,13 +531,6 @@ describe('stableDocId (via crypto, tested through observable behavior)', () => {
 });
 
 describe('validateFilterExpression', () => {
-  function validateFilterExpression(filter: string): void {
-    const FILTER_DISALLOWED_PATTERN = /[;|`$\\]/;
-    if (FILTER_DISALLOWED_PATTERN.test(filter)) {
-      throw new Error('valkey: filter expression contains disallowed characters.');
-    }
-  }
-
   test('valid filter expressions do not throw', () => {
     expect(() => validateFilterExpression('@price:[100 200]')).not.toThrow();
     expect(() => validateFilterExpression('@tag:{foo}')).not.toThrow();
@@ -600,6 +540,15 @@ describe('validateFilterExpression', () => {
 
   test.each([';', '|', '`', '$', '\\'])('blocks disallowed char %s', (char) => {
     expect(() => validateFilterExpression(`@field:[0 10]${char}inject`)).toThrow(
+      'disallowed characters'
+    );
+  });
+
+  test('blocks => KNN query injection sequence', () => {
+    expect(() =>
+      validateFilterExpression('@tag:{x})=>[KNN 99999 @embedding $query_vec]')
+    ).toThrow('disallowed characters');
+    expect(() => validateFilterExpression('foo=>bar')).toThrow(
       'disallowed characters'
     );
   });

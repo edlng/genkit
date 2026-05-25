@@ -20,6 +20,19 @@ import { valkeyPlugin, valkeyIndexerRef, valkeyRetrieverRef } from './src';
 const INDEX_NAME = 'coffee-menu';
 const DIMENSION = 768; // nomic-embed-text output dimension
 
+const valkey = valkeyPlugin([
+  {
+    indexName: INDEX_NAME,
+    embedder: ollama.embedder('nomic-embed-text'),
+    dimension: DIMENSION,
+    clientConfig: {
+      addresses: [
+        { host: process.env.VALKEY_HOST ?? 'localhost', port: 6379 },
+      ],
+    },
+  },
+]);
+
 const ai = genkit({
   plugins: [
     ollama({
@@ -27,18 +40,7 @@ const ai = genkit({
       models: [{ name: 'gemma4:e2b' }],
       embedders: [{ name: 'nomic-embed-text', dimensions: DIMENSION }],
     }),
-    valkeyPlugin([
-      {
-        indexName: INDEX_NAME,
-        embedder: ollama.embedder('nomic-embed-text'),
-        dimension: DIMENSION,
-        clientConfig: {
-          addresses: [
-            { host: process.env.VALKEY_HOST ?? 'localhost', port: 6379 },
-          ],
-        },
-      },
-    ]),
+    valkey.plugin,
   ],
 });
 
@@ -96,4 +98,4 @@ async function main() {
 main().catch((err) => {
   console.error(err);
   process.exit(1);
-});
+}).finally(() => valkey.close());

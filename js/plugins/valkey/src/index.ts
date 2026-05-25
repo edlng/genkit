@@ -30,7 +30,9 @@ import {
   indexerRef,
   retrieverRef,
   z,
+  type EmbedderAction,
   type EmbedderArgument,
+  type EmbedderReference,
   type Genkit,
 } from 'genkit';
 import { genkitPlugin, type GenkitPlugin } from 'genkit/plugin';
@@ -66,29 +68,34 @@ type ValkeyPluginParams<
   metadataFields?: ValkeyMetadataField[];
 }[];
 
-/** Tracks active GlideClient instances for cleanup on shutdown. */
-const activeClients: GlideClient[] = [];
-
 /**
- * Close all GlideClient connections created by the Valkey plugin.
- * Call this during application shutdown to prevent connection leaks.
+ * Handle returned by valkeyPlugin for managing plugin lifecycle.
+ * Call close() during application shutdown to release connections.
  */
-export async function closeValkeyClients(): Promise<void> {
-  const clients = activeClients.splice(0);
-  await Promise.all(clients.map((c) => c.close()));
+export interface ValkeyPluginHandle {
+  /** Close all GlideClient connections owned by this plugin instance. */
+  close(): Promise<void>;
+  /** The GenkitPlugin to pass to Genkit's plugins array. */
+  plugin: GenkitPlugin;
 }
 
 /**
  * Valkey plugin that provides a Valkey vector store retriever and indexer.
  * Requires a Valkey instance with the valkey-search module loaded.
+ *
+ * Returns a handle with a `plugin` property (pass to Genkit) and a `close()`
+ * method for connection cleanup. Each call creates an isolated set of clients
+ * scoped to the returned handle.
  */
 export function valkeyPlugin<EmbedderCustomOptions extends z.ZodTypeAny>(
   params: ValkeyPluginParams<EmbedderCustomOptions>
-): GenkitPlugin {
-  return genkitPlugin('valkey', async (ai: Genkit) => {
+): ValkeyPluginHandle {
+  const clients: GlideClient[] = [];
+
+  const plugin = genkitPlugin('valkey', async (ai: Genkit) => {
     for (const config of params) {
       const client = await GlideClient.createClient(config.clientConfig);
-      activeClients.push(client);
+      clients.push(client);
       const prefix = config.prefix ?? config.indexName;
       const distanceMetric = config.distanceMetric ?? 'COSINE';
       const metadataFields = config.metadataFields ?? [];
@@ -99,6 +106,14 @@ export function valkeyPlugin<EmbedderCustomOptions extends z.ZodTypeAny>(
       configureValkeyRetriever(ai, { ...config, prefix, client });
     }
   });
+
+  return {
+    plugin,
+    async close() {
+      const toClose = clients.splice(0);
+      await Promise.all(toClose.map((c) => c.close()));
+    },
+  };
 }
 
 /**
@@ -163,8 +178,9 @@ async function ensureIndex(
   };
   const contentField: TextField = { type: 'TEXT', name: '_content' };
   const metaField: TextField = { type: 'TEXT', name: '_metadata' };
+  const dataTypeField: TextField = { type: 'TEXT', name: '_dataType' };
 
-  const schema: Field[] = [vectorField, contentField, metaField];
+  const schema: Field[] = [vectorField, contentField, metaField, dataTypeField];
 
   for (const mf of metadataFields) {
     if (mf.type === 'NUMERIC') {
@@ -216,23 +232,18 @@ function configureValkeyIndexer<EmbedderCustomOptions extends z.ZodTypeAny>(
       configSchema: ValkeyIndexerOptionsSchema,
     },
     async (docs) => {
-      // Embed each document individually. ai.embedMany exists on the Genkit
-      // class but its internal resolver doesn't handle EmbedderReference
-      // objects (those with a 'name' but no '__action' or 'info'), so we use
-      // ai.embed which goes through resolveEmbedder and handles all ref types.
-      const embeddings = await Promise.all(
-        docs.map((doc) =>
-          ai.embed({
-            embedder,
-            content: doc,
-            options: embedderOptions,
-          }).then((result) => result[0])
-        )
-      );
+      // Resolve the embedder action once, then batch all documents in a single
+      // call. This avoids N round-trips to the embedder service.
+      const embedderAction = await resolveEmbedderAction(ai, embedder);
+      const response = await embedderAction({
+        input: docs.map((doc) => doc.toJSON()),
+        options: embedderOptions,
+      });
+      const allEmbeddings = response.embeddings;
 
       for (let i = 0; i < docs.length; i++) {
         const doc = docs[i];
-        const docEmbeddings = [embeddings[i]];
+        const docEmbeddings = [allEmbeddings[i]];
         const embeddingDocs = doc.getEmbeddingDocuments(docEmbeddings);
 
         for (let j = 0; j < docEmbeddings.length; j++) {
@@ -405,7 +416,8 @@ function safeJsonParse(value: string): Record<string, unknown> | undefined {
  * replacer would drop nested object properties (they must appear in the allowlist),
  * so we build the sorted JSON string manually instead.
  */
-function stableDocId(doc: { data: string; metadata?: unknown; dataType?: string }): string {
+/** @internal */
+export function stableDocId(doc: { data: string; metadata?: unknown; dataType?: string }): string {
   const sortedStringify = (v: unknown): string => {
     if (typeof v !== 'object' || v === null) return JSON.stringify(v);
     if (Array.isArray(v)) return '[' + v.map(sortedStringify).join(',') + ']';
@@ -422,22 +434,47 @@ function stableDocId(doc: { data: string; metadata?: unknown; dataType?: string 
 }
 
 /**
- * Characters that could alter FT.SEARCH query semantics if injected.
+ * Characters or sequences that could alter FT.SEARCH query semantics if injected.
  * This is a conservative allowlist approach: reject expressions containing
- * unbalanced brackets, pipes, or semicolons that could break out of the
- * filter context.
+ * unbalanced brackets, pipes, semicolons, or the KNN separator '=>' that could
+ * break out of the filter context.
  */
-const FILTER_DISALLOWED_PATTERN = /[;|`$\\]/;
+const FILTER_DISALLOWED_PATTERN = /[;|`$\\]|=>/;
 
 /**
  * Validates a filter expression to prevent query injection.
  * Throws if the expression contains characters that could alter query semantics.
  */
-function validateFilterExpression(filter: string): void {
+/** @internal */
+export function validateFilterExpression(filter: string): void {
   if (FILTER_DISALLOWED_PATTERN.test(filter)) {
     throw new Error(
       'valkey: filter expression contains disallowed characters. ' +
       'Do not pass untrusted user input as a filter.'
     );
   }
+}
+
+/**
+ * Resolves an EmbedderArgument to an EmbedderAction. Handles all reference
+ * variants: string name, EmbedderAction (has __action), and EmbedderReference
+ * (has name but may lack info).
+ */
+async function resolveEmbedderAction<CustomOptions extends z.ZodTypeAny>(
+  ai: Genkit,
+  embedder: EmbedderArgument<CustomOptions>
+): Promise<EmbedderAction<CustomOptions>> {
+  if (typeof embedder === 'string') {
+    return (await ai.registry.lookupAction(
+      `/embedder/${embedder}`
+    )) as EmbedderAction<CustomOptions>;
+  } else if (Object.hasOwnProperty.call(embedder, '__action')) {
+    return embedder as EmbedderAction<CustomOptions>;
+  } else if (Object.hasOwnProperty.call(embedder, 'name')) {
+    const ref = embedder as EmbedderReference<CustomOptions>;
+    return (await ai.registry.lookupAction(
+      `/embedder/${ref.name}`
+    )) as EmbedderAction<CustomOptions>;
+  }
+  throw new Error(`valkey: failed to resolve embedder`);
 }

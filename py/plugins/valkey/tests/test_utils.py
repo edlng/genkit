@@ -61,3 +61,11 @@ def test_validate_filter_allows_valid_expressions():
 def test_validate_filter_blocks_disallowed_chars(char):
     with pytest.raises(ValueError, match='disallowed characters'):
         _validate_filter(f'@field:[0 10]{char}inject')
+
+
+def test_validate_filter_blocks_knn_injection_sequence():
+    """The => token separates filter from KNN clause and must be blocked."""
+    with pytest.raises(ValueError, match='disallowed characters'):
+        _validate_filter('@tag:{x})=>[KNN 99999 @embedding $query_vec]')
+    with pytest.raises(ValueError, match='disallowed characters'):
+        _validate_filter('foo=>bar')

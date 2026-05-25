@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"strings"
 	"sync"
@@ -68,6 +69,7 @@ type Valkey struct {
 	mu      sync.Mutex
 	client  *glide.Client
 	initted bool
+	initErr error
 }
 
 // Close closes the underlying Glide client connection.
@@ -92,11 +94,15 @@ func (v *Valkey) Name() string {
 }
 
 // Init initializes the Valkey plugin by creating a Glide client connection.
+// If initialization fails, the error is stored and surfaced on first use via
+// newDocstore. This avoids panicking on recoverable errors like transient
+// network failures.
 func (v *Valkey) Init(ctx context.Context) []api.Action {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.initted {
-		panic("valkey.Init already called")
+		v.initErr = errors.New("valkey.Init already called")
+		return []api.Action{}
 	}
 
 	clientConfig := config.NewClientConfiguration()
@@ -106,7 +112,9 @@ func (v *Valkey) Init(ctx context.Context) []api.Action {
 
 	client, err := glide.NewClient(clientConfig)
 	if err != nil {
-		panic(fmt.Errorf("valkey.Init: failed to create client: %w", err))
+		v.initErr = fmt.Errorf("valkey.Init: failed to create client: %w", err)
+		v.initted = true
+		return []api.Action{}
 	}
 	v.client = client
 	v.initted = true
@@ -182,7 +190,10 @@ func (v *Valkey) newDocstore(ctx context.Context, cfg Config) (*Docstore, error)
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if !v.initted {
-		panic("valkey.Init not called")
+		return nil, errors.New("valkey.Init not called")
+	}
+	if v.initErr != nil {
+		return nil, v.initErr
 	}
 	if cfg.IndexName == "" {
 		return nil, errors.New("valkey: IndexName required")
@@ -261,7 +272,7 @@ func ensureIndex(
 }
 
 // Index stores documents in Valkey as Hashes with vector embeddings.
-func Index(ctx context.Context, docs []*ai.Document, ds *Docstore) error {
+func (ds *Docstore) Index(ctx context.Context, docs []*ai.Document) error {
 	if len(docs) == 0 {
 		return nil
 	}
@@ -341,6 +352,9 @@ func (ds *Docstore) Retrieve(ctx context.Context, req *ai.RetrieverRequest) (*ai
 		if ropt.K > 0 {
 			k = ropt.K
 		}
+		if k > 1000 {
+			return nil, errors.New("valkey: K must not exceed 1000")
+		}
 		filter = ropt.Filter
 	}
 
@@ -400,7 +414,8 @@ func (ds *Docstore) Retrieve(ctx context.Context, req *ai.RetrieverRequest) (*ai
 		var meta map[string]any
 		if metadataStr != "" && metadataStr != "{}" {
 			if err := json.Unmarshal([]byte(metadataStr), &meta); err != nil {
-				meta = nil
+				slog.Warn("valkey: failed to parse document metadata", "key", doc.Key, "error", err)
+				meta = map[string]any{"_metadata_parse_error": true}
 			}
 		}
 
@@ -452,10 +467,13 @@ func fieldToString(v any) string {
 const filterDisallowedChars = ";|`$\\"
 
 // validateFilter checks that a filter expression does not contain characters
-// that could break out of the filter context.
+// or sequences that could break out of the filter context.
 func validateFilter(filter string) error {
 	if strings.ContainsAny(filter, filterDisallowedChars) {
 		return errors.New("valkey: filter expression contains disallowed characters; do not pass untrusted user input as a filter")
+	}
+	if strings.Contains(filter, "=>") {
+		return errors.New("valkey: filter expression contains disallowed sequence '=>'; do not pass untrusted user input as a filter")
 	}
 	return nil
 }

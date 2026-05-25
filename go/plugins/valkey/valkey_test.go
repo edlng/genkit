@@ -134,6 +134,8 @@ func TestValidateFilter(t *testing.T) {
 		{"val`cmd", true},
 		{"$var", true},
 		{`back\slash`, true},
+		{"@tag:{x})=>[KNN 99999 @embedding $query_vec]", true},
+		{"foo=>bar", true},
 	} {
 		err := validateFilter(tc.filter)
 		if (err != nil) != tc.wantErr {
@@ -209,7 +211,7 @@ func TestIndexEmbedderError(t *testing.T) {
 		Dimension: 3,
 	}
 	docs := []*ai.Document{ai.DocumentFromText("hello", nil)}
-	err := Index(context.Background(), docs, ds)
+	err := ds.Index(context.Background(), docs)
 	if err == nil {
 		t.Fatal("expected error from embedder, got nil")
 	}
@@ -228,7 +230,7 @@ func TestIndexEmbeddingCountMismatch(t *testing.T) {
 		ai.DocumentFromText("doc1", nil),
 		ai.DocumentFromText("doc2", nil),
 	}
-	err := Index(context.Background(), docs, ds)
+	err := ds.Index(context.Background(), docs)
 	if err == nil {
 		t.Fatal("expected embedding count mismatch error, got nil")
 	}
@@ -243,7 +245,7 @@ func TestIndexEmptyDocs(t *testing.T) {
 		Prefix:    "test",
 		Dimension: 3,
 	}
-	err := Index(context.Background(), nil, ds)
+	err := ds.Index(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("expected nil error for empty docs, got: %v", err)
 	}
@@ -285,6 +287,40 @@ func TestRetrieveInvalidOptions(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "RetrieverOptions") {
 		t.Errorf("expected error about RetrieverOptions type, got: %v", err)
+	}
+}
+
+func TestRetrieveWithFilter(t *testing.T) {
+	ds := &Docstore{
+		Embedder:  &errorEmbedder{err: fmt.Errorf("should not reach embedder")},
+		IndexName: "test-index",
+		Prefix:    "test",
+		Dimension: 3,
+	}
+
+	for _, tc := range []struct {
+		filter  string
+		wantErr string
+	}{
+		// Valid filter expressions should not fail validation (error comes from embedder).
+		{"@price:[100 200]", "should not reach embedder"},
+		{"@tag:{foo}", "should not reach embedder"},
+		// Injected KNN separator must be rejected before reaching the embedder.
+		{"@tag:{x})=>[KNN 99999 @embedding $query_vec]", "disallowed"},
+		{"@a;@b", "disallowed"},
+	} {
+		req := &ai.RetrieverRequest{
+			Query:   ai.DocumentFromText("query", nil),
+			Options: &RetrieverOptions{Filter: tc.filter},
+		}
+		_, err := ds.Retrieve(context.Background(), req)
+		if err == nil {
+			t.Errorf("filter=%q: expected error, got nil", tc.filter)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.wantErr) {
+			t.Errorf("filter=%q: got %q, want substring %q", tc.filter, err.Error(), tc.wantErr)
+		}
 	}
 }
 
@@ -380,7 +416,7 @@ func TestIntegration(t *testing.T) {
 	}
 
 	// Index documents.
-	if err := Index(ctx, []*ai.Document{d1, d2, d3}, ds); err != nil {
+	if err := ds.Index(ctx, []*ai.Document{d1, d2, d3}); err != nil {
 		t.Fatalf("Index failed: %v", err)
 	}
 

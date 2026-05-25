@@ -5,15 +5,13 @@
 // Prerequisites:
 //  1. Valkey 8+ with valkey-search module:
 //     docker run -d --name valkey -p 6379:6379 valkey/valkey:8-alpine
-//  2. From the repo root: go mod tidy
-//  3. An embedder registered in your Genkit setup. This sample uses the
-//     fakeembedder for self-contained execution; swap for a real embedder
-//     (e.g., googleai, ollama) in production.
-//     If using Ollama: ollama pull nomic-embed-text
+//  2. Ollama running locally with nomic-embed-text pulled:
+//     ollama pull nomic-embed-text
+//  3. From the go/ directory: go mod tidy
 //
-// Run (from repo root):
+// Run (from go/ directory):
 //
-//	go run go/plugins/valkey/valkey_sample.go -valkey-addr localhost:6379
+//	go run ./samples/valkey/main.go -valkey-addr localhost:6379
 
 package main
 
@@ -27,19 +25,27 @@ import (
 	"github.com/firebase/genkit/go/ai"
 	"github.com/firebase/genkit/go/core"
 	"github.com/firebase/genkit/go/genkit"
-	"github.com/firebase/genkit/go/internal/fakeembedder"
+	"github.com/firebase/genkit/go/plugins/ollama"
 	valkeyplugin "github.com/firebase/genkit/go/plugins/valkey"
 	"github.com/valkey-io/valkey-glide/go/v2/config"
 )
 
-var valkeyAddr = flag.String("valkey-addr", "localhost:6379", "Valkey address host:port")
+var (
+	valkeyAddr = flag.String("valkey-addr", "localhost:6379", "Valkey address host:port")
+	ollamaAddr = flag.String("ollama-addr", "http://localhost:11434", "Ollama server address")
+)
+
+const (
+	indexName = "coffee-menu-go"
+	dimension = 768 // nomic-embed-text output dimension
+)
 
 func main() {
 	flag.Parse()
 
 	ctx := context.Background()
 
-	// --- Parse address ---
+	// --- Parse Valkey address ---
 	parts := strings.SplitN(*valkeyAddr, ":", 2)
 	host := parts[0]
 	port := 6379
@@ -49,47 +55,28 @@ func main() {
 		}
 	}
 
-	// --- Bootstrap: init Genkit with the Valkey plugin ---
-	g := genkit.Init(ctx, genkit.WithPlugins(&valkeyplugin.Valkey{
-		Addresses: []config.NodeAddress{{Host: host, Port: port}},
-	}))
+	// --- Bootstrap: init Genkit with Ollama + Valkey plugins ---
+	ollamaPlugin := &ollama.Ollama{ServerAddress: *ollamaAddr}
 
-	// --- Define a fake embedder (3-dimensional) ---
-	const dim = 3
-	const indexName = "coffee-menu-go"
+	g := genkit.Init(ctx, genkit.WithPlugins(
+		ollamaPlugin,
+		&valkeyplugin.Valkey{
+			Addresses: []config.NodeAddress{{Host: host, Port: port}},
+		},
+	))
 
-	docs := []*ai.Document{
-		ai.DocumentFromText("Espresso: concentrated coffee brewed under pressure. $3.50", nil),
-		ai.DocumentFromText("Latte: espresso with steamed milk and foam. $4.75", nil),
-		ai.DocumentFromText("Cold Brew: steeped in cold water 12-24h, served chilled. $4.25", nil),
-		ai.DocumentFromText("Croissant: buttery flaky French pastry. $3.00", nil),
-	}
-
-	// Assign hand-crafted vectors: coffee drinks cluster near [1,0,0]; food near [0,0,1].
-	vectors := [][]float32{
-		{1.0, 0.0, 0.0},
-		{0.9, 0.1, 0.0},
-		{0.8, 0.2, 0.0},
-		{0.0, 0.0, 1.0},
-	}
-
-	fake := fakeembedder.New()
-	for i, d := range docs {
-		fake.Register(d, vectors[i])
-	}
-
-	emdOpts := &ai.EmbedderOptions{
-		Dimensions: dim,
-		Label:      "fake-embedder",
+	// --- Define embedder using Ollama nomic-embed-text ---
+	embedder := ollamaPlugin.DefineEmbedder(g, *ollamaAddr, "nomic-embed-text", &ai.EmbedderOptions{
+		Dimensions: dimension,
+		Label:      "nomic-embed-text",
 		Supports:   &ai.EmbedderSupports{Input: []string{"text"}},
-	}
-	embedder := genkit.DefineEmbedder(g, "fake/embedder", emdOpts, fake.Embed)
+	})
 
 	// --- Define retriever (creates FT index if absent) ---
 	cfg := valkeyplugin.Config{
 		IndexName: indexName,
 		Embedder:  embedder,
-		Dimension: dim,
+		Dimension: dimension,
 	}
 	retOpts := &ai.RetrieverOptions{
 		ConfigSchema: core.InferSchemaMap(valkeyplugin.RetrieverOptions{}),
@@ -101,16 +88,21 @@ func main() {
 		log.Fatalf("DefineRetriever: %v", err)
 	}
 
-	// --- Indexing flow ---
-	if err := valkeyplugin.Index(ctx, docs, ds); err != nil {
+	// --- Index documents ---
+	docs := []*ai.Document{
+		ai.DocumentFromText("Espresso: a concentrated coffee brewed by forcing hot water through finely-ground beans. $3.50", nil),
+		ai.DocumentFromText("Latte: espresso with steamed milk and a thin layer of foam. $4.75", nil),
+		ai.DocumentFromText("Cold Brew: coffee steeped in cold water for 12-24 hours, served chilled. $4.25", nil),
+		ai.DocumentFromText("Croissant: a buttery, flaky pastry of French origin. $3.00", nil),
+	}
+
+	if err := ds.Index(ctx, docs); err != nil {
 		log.Fatalf("Index: %v", err)
 	}
 	fmt.Printf("Indexed %d documents into %q.\n", len(docs), indexName)
 
-	// --- Retrieval flow ---
+	// --- Retrieve ---
 	query := ai.DocumentFromText("What cold coffee drinks do you have?", nil)
-	// Register query vector (similar to espresso/latte/cold-brew cluster).
-	fake.Register(query, []float32{0.85, 0.15, 0.0})
 
 	resp, err := genkit.Retrieve(ctx, g,
 		ai.WithRetriever(retriever),
