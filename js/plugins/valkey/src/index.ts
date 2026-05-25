@@ -216,26 +216,19 @@ function configureValkeyIndexer<EmbedderCustomOptions extends z.ZodTypeAny>(
       configSchema: ValkeyIndexerOptionsSchema,
     },
     async (docs) => {
-      // Batch-embed all documents in a single call for efficiency.
-      // Fall back to per-document embedding if embedMany is unavailable.
-      let embeddings: { embedding: number[] }[];
-      if (ai.embedMany) {
-        embeddings = await ai.embedMany({
-          embedder,
-          content: docs,
-          options: embedderOptions,
-        });
-      } else {
-        embeddings = await Promise.all(
-          docs.map((doc) =>
-            ai.embed({
-              embedder,
-              content: doc,
-              options: embedderOptions,
-            }).then((result) => result[0])
-          )
-        );
-      }
+      // Embed each document individually. ai.embedMany exists on the Genkit
+      // class but its internal resolver doesn't handle EmbedderReference
+      // objects (those with a 'name' but no '__action' or 'info'), so we use
+      // ai.embed which goes through resolveEmbedder and handles all ref types.
+      const embeddings = await Promise.all(
+        docs.map((doc) =>
+          ai.embed({
+            embedder,
+            content: doc,
+            options: embedderOptions,
+          }).then((result) => result[0])
+        )
+      );
 
       for (let i = 0; i < docs.length; i++) {
         const doc = docs[i];
