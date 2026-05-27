@@ -109,6 +109,7 @@ func (v *Valkey) Init(ctx context.Context) []api.Action {
 	for i := range v.Addresses {
 		clientConfig.WithAddress(&v.Addresses[i])
 	}
+	clientConfig.WithClientName("genkit_vector_store_client")
 
 	client, err := glide.NewClient(clientConfig)
 	if err != nil {
