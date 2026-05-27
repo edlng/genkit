@@ -28,7 +28,9 @@ import { Document } from 'genkit/retriever';
 
 // Mock @valkey/valkey-glide
 const mockHset = jest.fn<any>().mockResolvedValue(1);
-const mockClient = { hset: mockHset };
+const mockBatchHset = jest.fn<any>().mockReturnValue(undefined);
+const mockExec = jest.fn<any>().mockResolvedValue([]);
+const mockClient = { hset: mockHset, exec: mockExec };
 
 const mockGlideFtCreate = jest.fn<any>().mockResolvedValue('OK');
 const mockGlideFtSearch = jest.fn<any>();
@@ -41,6 +43,10 @@ jest.mock('@valkey/valkey-glide', () => ({
     create: (...args: unknown[]) => mockGlideFtCreate(...args),
     search: (...args: unknown[]) => mockGlideFtSearch(...args),
   },
+  Batch: jest.fn<any>().mockImplementation(() => {
+    const instance = { hset: (...args: unknown[]) => { mockBatchHset(...args); return instance; } };
+    return instance;
+  }),
 }));
 
 // Import after mocks are set up
@@ -242,15 +248,16 @@ describe('valkeyIndexer', () => {
         input: expect.any(Array),
       })
     );
-    expect(mockHset).toHaveBeenCalledWith(
+    expect(mockBatchHset).toHaveBeenCalledWith(
       expect.stringMatching(/^test-index:/),
-      expect.arrayContaining([
-        expect.objectContaining({ field: 'embedding' }),
-        expect.objectContaining({ field: '_content' }),
-        expect.objectContaining({ field: '_metadata' }),
-        expect.objectContaining({ field: '_dataType' }),
-      ])
+      expect.objectContaining({
+        embedding: expect.anything(),
+        _content: expect.any(String),
+        _metadata: expect.any(String),
+        _dataType: expect.any(String),
+      })
     );
+    expect(mockExec).toHaveBeenCalledTimes(1);
   });
 
   test('should convert embedding to Float32 buffer', async () => {
@@ -262,15 +269,15 @@ describe('valkeyIndexer', () => {
     const doc = new Document({ content: [{ text: 'test' }] });
     await indexerHandler([doc]);
 
-    const hsetCall = mockHset.mock.calls[0] as unknown[];
-    const fields = hsetCall[1] as { field: string; value: any }[];
-    const embeddingField = fields.find((f) => f.field === 'embedding');
+    const hsetCall = mockBatchHset.mock.calls[0] as unknown[];
+    const fields = hsetCall[1] as Record<string, any>;
+    const embeddingValue = fields['embedding'];
 
-    expect(embeddingField).toBeDefined();
-    expect(embeddingField!.value).toBeInstanceOf(Buffer);
+    expect(embeddingValue).toBeDefined();
+    expect(embeddingValue).toBeInstanceOf(Buffer);
 
     const expected = Buffer.from(new Float32Array(embedding).buffer);
-    expect(embeddingField!.value).toEqual(expected);
+    expect(embeddingValue).toEqual(expected);
   });
 
   test('should serialize metadata as JSON', async () => {
@@ -286,12 +293,12 @@ describe('valkeyIndexer', () => {
 
     await indexerHandler([doc]);
 
-    const hsetCall = mockHset.mock.calls[0] as unknown[];
-    const fields = hsetCall[1] as { field: string; value: any }[];
-    const metadataField = fields.find((f) => f.field === '_metadata');
+    const hsetCall = mockBatchHset.mock.calls[0] as unknown[];
+    const fields = hsetCall[1] as Record<string, any>;
+    const metadataValue = fields['_metadata'];
 
-    expect(metadataField).toBeDefined();
-    expect(JSON.parse(metadataField!.value)).toEqual(metadata);
+    expect(metadataValue).toBeDefined();
+    expect(JSON.parse(metadataValue)).toEqual(metadata);
   });
 
   test('should handle multiple documents', async () => {
@@ -313,7 +320,8 @@ describe('valkeyIndexer', () => {
 
     // Batched: single call to embedder with all docs
     expect(mockEmbedderAction).toHaveBeenCalledTimes(1);
-    expect(mockHset).toHaveBeenCalledTimes(3);
+    expect(mockBatchHset).toHaveBeenCalledTimes(3);
+    expect(mockExec).toHaveBeenCalledTimes(1);
   });
 });
 

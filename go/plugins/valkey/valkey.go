@@ -38,6 +38,7 @@ import (
 	"github.com/valkey-io/valkey-glide/go/v2/config"
 	"github.com/valkey-io/valkey-glide/go/v2/constants"
 	glideopts "github.com/valkey-io/valkey-glide/go/v2/options"
+	"github.com/valkey-io/valkey-glide/go/v2/pipeline"
 	"github.com/valkey-io/valkey-glide/go/v2/servermodules/glideft"
 )
 
@@ -109,7 +110,7 @@ func (v *Valkey) Init(ctx context.Context) []api.Action {
 	for i := range v.Addresses {
 		clientConfig.WithAddress(&v.Addresses[i])
 	}
-
+	clientConfig.WithClientName("genkit_valkey_client")
 	client, err := glide.NewClient(clientConfig)
 	if err != nil {
 		v.initErr = fmt.Errorf("valkey.Init: failed to create client: %w", err)
@@ -162,6 +163,10 @@ type Docstore struct {
 
 // DefineRetriever defines a Retriever backed by Valkey vector search.
 // It ensures the FT index exists and registers the retriever action.
+//
+// Note: The Go Genkit SDK does not currently provide a DefineIndexer API.
+// Use the returned Docstore's Index method directly for indexing documents.
+// See the localvec and weaviate plugins for the same pattern.
 func DefineRetriever(ctx context.Context, g *genkit.Genkit, cfg Config, opts *ai.RetrieverOptions) (*Docstore, ai.Retriever, error) {
 	plugin := genkit.LookupPlugin(g, provider)
 	if plugin == nil {
@@ -216,7 +221,7 @@ func (v *Valkey) newDocstore(ctx context.Context, cfg Config) (*Docstore, error)
 	}
 
 	if err := ensureIndex(ctx, v.client, cfg.IndexName, cfg.Dimension, prefix, metric, cfg.MetadataFields); err != nil {
-		return nil, fmt.Errorf("valkey: failed to ensure index: %v", err)
+		return nil, fmt.Errorf("valkey: failed to ensure index: %w", err)
 	}
 
 	return &Docstore{
@@ -283,16 +288,25 @@ func (ds *Docstore) Index(ctx context.Context, docs []*ai.Document) error {
 	}
 	eres, err := ds.Embedder.Embed(ctx, ereq)
 	if err != nil {
-		return fmt.Errorf("valkey index embedding failed: %v", err)
+		return fmt.Errorf("valkey index embedding failed: %w", err)
 	}
 
 	if len(eres.Embeddings) != len(docs) {
 		return fmt.Errorf("valkey: embedder returned %d embeddings for %d docs", len(eres.Embeddings), len(docs))
 	}
+
+	// Pre-validate all embeddings before writing anything.
 	for i, de := range eres.Embeddings {
 		if len(de.Embedding) != ds.Dimension {
 			return fmt.Errorf("valkey: embedder returned %d-dim vector for doc %d, expected %d", len(de.Embedding), i, ds.Dimension)
 		}
+	}
+
+	// Build all HSet commands into a non-atomic batch (pipeline) and execute
+	// in a single round-trip.
+	batch := pipeline.NewStandaloneBatch(false)
+
+	for i, de := range eres.Embeddings {
 		doc := docs[i]
 		id, err := docID(doc)
 		if err != nil {
@@ -306,23 +320,20 @@ func (ds *Docstore) Index(ctx context.Context, docs []*ai.Document) error {
 
 		metadataJSON, err := json.Marshal(doc.Metadata)
 		if err != nil {
-			return fmt.Errorf("valkey: error marshaling metadata: %v", err)
+			return fmt.Errorf("valkey: error marshaling metadata: %w", err)
 		}
 
-		// Go strings can hold arbitrary bytes; this is the correct way to pass
-		// binary vector data to HSet which expects string-typed field values.
 		embeddingBytes := float32SliceToBytes(de.Embedding)
 
 		key := fmt.Sprintf("%s:%s", ds.Prefix, id)
 		fields := map[string]string{
-			"embedding": string(embeddingBytes), // Go strings can hold arbitrary bytes for HSet
+			"embedding": string(embeddingBytes),
 			"_content":  sb.String(),
 			"_metadata": string(metadataJSON),
-			"_dataType": "text",
+			"_dataType": "text", // Go SDK Document lacks DataType field; always "text" for now
 		}
 
 		// Store declared metadata keys as top-level HASH fields for filtering.
-		// Numeric fields preserve numeric formatting; TAG fields use %v.
 		if doc.Metadata != nil {
 			for _, mf := range ds.MetadataFields {
 				if val, ok := doc.Metadata[mf.Name]; ok {
@@ -331,10 +342,12 @@ func (ds *Docstore) Index(ctx context.Context, docs []*ai.Document) error {
 			}
 		}
 
-		_, err = ds.Client.HSet(ctx, key, fields)
-		if err != nil {
-			return fmt.Errorf("valkey: error storing document %s: %v", key, err)
-		}
+		batch.HSet(key, fields)
+	}
+
+	_, err = ds.Client.Exec(ctx, *batch, true)
+	if err != nil {
+		return fmt.Errorf("valkey: batch index failed: %w", err)
 	}
 
 	return nil
@@ -370,7 +383,7 @@ func (ds *Docstore) Retrieve(ctx context.Context, req *ai.RetrieverRequest) (*ai
 	}
 	eres, err := ds.Embedder.Embed(ctx, ereq)
 	if err != nil {
-		return nil, fmt.Errorf("valkey retrieve embedding failed: %v", err)
+		return nil, fmt.Errorf("valkey retrieve embedding failed: %w", err)
 	}
 
 	if len(eres.Embeddings) == 0 {
@@ -400,7 +413,7 @@ func (ds *Docstore) Retrieve(ctx context.Context, req *ai.RetrieverRequest) (*ai
 
 	result, err := glideft.FtSearch(ctx, ds.Client, ds.IndexName, query, searchOpts)
 	if err != nil {
-		return nil, fmt.Errorf("valkey retrieve search failed: %v", err)
+		return nil, fmt.Errorf("valkey retrieve search failed: %w", err)
 	}
 
 	docs := make([]*ai.Document, 0, len(result.Documents))
@@ -410,6 +423,11 @@ func (ds *Docstore) Retrieve(ctx context.Context, req *ai.RetrieverRequest) (*ai
 			continue
 		}
 		metadataStr := fieldToString(doc.Fields["_metadata"])
+		// Read _dataType for cross-language consistency. The Go SDK Document
+		// struct does not expose a DataType field, so we cannot reconstruct
+		// non-text documents yet. The value is preserved in storage for
+		// interop with JS/Python retrievers.
+		_ = fieldToString(doc.Fields["_dataType"])
 
 		var meta map[string]any
 		if metadataStr != "" && metadataStr != "{}" {
@@ -439,12 +457,22 @@ func float32SliceToBytes(v []float32) []byte {
 }
 
 // docID returns the ID to use for a Document.
-// Go's encoding/json sorts map[string]* keys; struct fields follow declaration
-// order — both are deterministic, so the resulting hash is stable.
+// Uses a canonical serialization format (sorted JSON of {content, metadata, dataType})
+// that matches the JS and Python implementations for cross-language interop.
 func docID(doc *ai.Document) (string, error) {
-	b, err := json.Marshal(doc)
+	var sb strings.Builder
+	for _, p := range doc.Content {
+		sb.WriteString(p.Text)
+	}
+
+	canonical := map[string]any{
+		"data":     sb.String(),
+		"metadata": doc.Metadata,
+		"dataType": "text",
+	}
+	b, err := json.Marshal(canonical)
 	if err != nil {
-		return "", fmt.Errorf("valkey: error marshaling document: %v", err)
+		return "", fmt.Errorf("valkey: error marshaling document: %w", err)
 	}
 	return fmt.Sprintf("%02x", md5.Sum(b)), nil
 }
@@ -466,9 +494,16 @@ func fieldToString(v any) string {
 // semantics if injected into a filter expression.
 const filterDisallowedChars = ";|`$\\"
 
+// maxFilterLength is the maximum allowed length for a filter expression to
+// prevent DoS via query amplification.
+const maxFilterLength = 2048
+
 // validateFilter checks that a filter expression does not contain characters
 // or sequences that could break out of the filter context.
 func validateFilter(filter string) error {
+	if len(filter) > maxFilterLength {
+		return errors.New("valkey: filter expression too long")
+	}
 	if strings.ContainsAny(filter, filterDisallowedChars) {
 		return errors.New("valkey: filter expression contains disallowed characters; do not pass untrusted user input as a filter")
 	}
