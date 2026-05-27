@@ -156,7 +156,8 @@ class Valkey(Plugin):
             else:
                 client = await GlideClient.create(
                     GlideClientConfiguration(
-                        addresses=[NodeAddress(cfg.host, cfg.port)]
+                        addresses=[NodeAddress(cfg.host, cfg.port)],
+                        client_name="genkit_vector_store_client",
                     )
                 )
                 client_cache[cache_key] = client
