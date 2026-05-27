@@ -94,7 +94,11 @@ export function valkeyPlugin<EmbedderCustomOptions extends z.ZodTypeAny>(
 
   const plugin = genkitPlugin('valkey', async (ai: Genkit) => {
     for (const config of params) {
-      const client = await GlideClient.createClient(config.clientConfig);
+      const clientConfig = { ...config.clientConfig };
+      if (!clientConfig.clientName) {
+        clientConfig.clientName = "genkit_vector_store_client";
+      }
+      const client = await GlideClient.createClient(clientConfig);
       clients.push(client);
       const prefix = config.prefix ?? config.indexName;
       const distanceMetric = config.distanceMetric ?? 'COSINE';
