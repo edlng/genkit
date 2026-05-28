@@ -75,6 +75,11 @@ Each entry in the plugin params array accepts:
 | `distanceMetric` | `'COSINE' \| 'L2' \| 'IP'` | No | HNSW distance metric (defaults to `COSINE`) |
 | `metadataFields` | `ValkeyMetadataField[]` | No | Metadata fields to index for query-time filtering |
 
+## Limitations
+
+- **Standalone mode only**: This plugin uses `GlideClient` (standalone). Cluster
+  deployments (`GlideClusterClient`) are not yet supported.
+
 ## License
 
 Apache-2.0

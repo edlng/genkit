@@ -31,6 +31,7 @@ from enum import Enum
 from typing import Any
 
 from glide import (
+    Batch,
     DataType,
     DistanceMetricType,
     FtCreateOptions,
@@ -39,6 +40,7 @@ from glide import (
     GlideClientConfiguration,
     NodeAddress,
     NumericField,
+    RequestError,
     ReturnField,
     TagField,
     TextField,
@@ -122,8 +124,18 @@ def _float32_to_bytes(vec: list[float]) -> bytes:
 
 
 def _doc_id(doc: Document) -> str:
-    """Compute a deterministic document ID (MD5 of JSON serialization)."""
-    serialized = json.dumps(doc.model_dump(by_alias=True), sort_keys=True)
+    """Compute a deterministic document ID (MD5 of canonical JSON).
+
+    Uses a canonical serialization format {data, dataType, metadata} with
+    sorted keys that matches the Go and JS implementations for cross-language
+    interop.
+    """
+    canonical = {
+        'data': doc.data,
+        'dataType': doc.data_type or 'text',
+        'metadata': doc.metadata,
+    }
+    serialized = json.dumps(canonical, sort_keys=True, separators=(',', ':'))
     return hashlib.md5(serialized.encode()).hexdigest()
 
 
@@ -250,12 +262,21 @@ class Valkey(Plugin):
                 raise ValueError(
                     f'valkey: embedder returned {len(embed_response.embeddings)} embeddings for {len(req.documents)} docs'
                 )
+
             for i, doc in enumerate(req.documents):
                 embedding = embed_response.embeddings[i].embedding
                 if len(embedding) != cfg.dimension:
                     raise ValueError(
                         f'valkey: embedder returned {len(embedding)}-dim vector, expected {cfg.dimension}'
                     )
+
+            # Chunk documents into batches to avoid unbounded pipeline sizes
+            # that could cause OOM or timeouts with very large inputs.
+            _INDEX_BATCH_SIZE = 1000
+
+            entries: list[tuple[str, dict[str, bytes | str]]] = []
+            for i, doc in enumerate(req.documents):
+                embedding = embed_response.embeddings[i].embedding
                 vec_bytes = _float32_to_bytes(embedding)
                 doc_key = _doc_id(doc)
                 content = doc.data
@@ -285,7 +306,14 @@ class Valkey(Plugin):
                             else:
                                 fields[mf.name] = str(val)
 
-                await client.hset(key, fields)
+                entries.append((key, fields))
+
+            for start in range(0, len(entries), _INDEX_BATCH_SIZE):
+                chunk = entries[start:start + _INDEX_BATCH_SIZE]
+                batch = Batch(is_atomic=False)
+                for key, fields in chunk:
+                    batch.hset(key, fields)
+                await client.exec(batch, raise_on_error=True)
 
             return IndexerResponse()
 
@@ -413,13 +441,15 @@ async def _ensure_index(
 
     try:
         await glide_ft.create(client, index_name, schema, options)
-    except Exception as e:
+    except RequestError as e:
         if 'already exists' in str(e).lower():
             return
         raise
 
 
 _FILTER_DISALLOWED_PATTERN = re.compile(r'[;|`$\\]|=>')
+
+_MAX_FILTER_LENGTH = 2048
 
 
 def _validate_filter(filter_expr: str) -> None:
@@ -428,6 +458,8 @@ def _validate_filter(filter_expr: str) -> None:
     Raises ValueError if the expression contains characters or sequences that
     could alter FT.SEARCH query semantics.
     """
+    if len(filter_expr) > _MAX_FILTER_LENGTH:
+        raise ValueError('valkey: filter expression too long')
     if _FILTER_DISALLOWED_PATTERN.search(filter_expr):
         raise ValueError(
             'valkey: filter expression contains disallowed characters. '

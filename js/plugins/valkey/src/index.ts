@@ -15,6 +15,7 @@
  */
 
 import {
+  Batch,
   GlideClient,
   GlideFt,
   type Field,
@@ -245,6 +246,13 @@ function configureValkeyIndexer<EmbedderCustomOptions extends z.ZodTypeAny>(
       });
       const allEmbeddings = response.embeddings;
 
+      // Collect all hset entries, then chunk into batches of INDEX_BATCH_SIZE
+      // to avoid unbounded pipeline sizes that could cause OOM or timeouts.
+      const INDEX_BATCH_SIZE = 1000;
+
+      type HSetEntry = { key: string; fields: Record<string, string | Buffer> };
+      const entries: HSetEntry[] = [];
+
       for (let i = 0; i < docs.length; i++) {
         const doc = docs[i];
         const docEmbeddings = [allEmbeddings[i]];
@@ -258,18 +266,12 @@ function configureValkeyIndexer<EmbedderCustomOptions extends z.ZodTypeAny>(
             new Float32Array(embedding).buffer
           );
 
-          const fields: { field: string; value: string | Buffer }[] = [
-            { field: 'embedding', value: embeddingBuffer },
-            { field: '_content', value: embeddingDoc.data },
-            {
-              field: '_metadata',
-              value: JSON.stringify(embeddingDoc.metadata ?? {}),
-            },
-            {
-              field: '_dataType',
-              value: embeddingDoc.dataType ?? '',
-            },
-          ];
+          const fields: Record<string, string | Buffer> = {
+            embedding: embeddingBuffer,
+            _content: embeddingDoc.data,
+            _metadata: JSON.stringify(embeddingDoc.metadata ?? {}),
+            _dataType: embeddingDoc.dataType ?? '',
+          };
 
           // Store declared metadata keys as top-level HASH fields for filtering.
           // Numeric fields are stored as-is to preserve Valkey numeric indexing;
@@ -284,16 +286,25 @@ function configureValkeyIndexer<EmbedderCustomOptions extends z.ZodTypeAny>(
                       `valkey: NUMERIC metadata field '${mf.name}' received non-number value: ${typeof val}`
                     );
                   }
-                  fields.push({ field: mf.name, value: val.toString() });
+                  fields[mf.name] = val.toString();
                 } else {
-                  fields.push({ field: mf.name, value: String(val) });
+                  fields[mf.name] = String(val);
                 }
               }
             }
           }
 
-          await client.hset(`${prefix}:${id}`, fields);
+          entries.push({ key: `${prefix}:${id}`, fields });
         }
+      }
+
+      for (let start = 0; start < entries.length; start += INDEX_BATCH_SIZE) {
+        const chunk = entries.slice(start, start + INDEX_BATCH_SIZE);
+        const batch = new Batch(false);
+        for (const entry of chunk) {
+          batch.hset(entry.key, entry.fields);
+        }
+        await client.exec(batch, true);
       }
     }
   );
@@ -415,13 +426,17 @@ function safeJsonParse(value: string): Record<string, unknown> | undefined {
 }
 
 /**
- * Produces a deterministic document ID by recursively sorting all object keys
- * before serializing and hashing with MD5. Using an array as the JSON.stringify
- * replacer would drop nested object properties (they must appear in the allowlist),
- * so we build the sorted JSON string manually instead.
+ * Produces a deterministic document ID using a canonical serialization format
+ * ({data, dataType, metadata} with sorted keys) that matches the Go and Python
+ * implementations for cross-language interop.
  */
 /** @internal */
 export function stableDocId(doc: { data: string; metadata?: unknown; dataType?: string }): string {
+  const canonical = {
+    data: doc.data,
+    dataType: doc.dataType ?? 'text',
+    metadata: doc.metadata ?? null,
+  };
   const sortedStringify = (v: unknown): string => {
     if (typeof v !== 'object' || v === null) return JSON.stringify(v);
     if (Array.isArray(v)) return '[' + v.map(sortedStringify).join(',') + ']';
@@ -434,7 +449,7 @@ export function stableDocId(doc: { data: string; metadata?: unknown; dataType?: 
       '}'
     );
   };
-  return createHash('md5').update(sortedStringify(doc)).digest('hex');
+  return createHash('md5').update(sortedStringify(canonical)).digest('hex');
 }
 
 /**
@@ -445,12 +460,18 @@ export function stableDocId(doc: { data: string; metadata?: unknown; dataType?: 
  */
 const FILTER_DISALLOWED_PATTERN = /[;|`$\\]|=>/;
 
+/** Maximum allowed filter expression length to prevent DoS via query amplification. */
+const MAX_FILTER_LENGTH = 2048;
+
 /**
  * Validates a filter expression to prevent query injection.
  * Throws if the expression contains characters that could alter query semantics.
  */
 /** @internal */
 export function validateFilterExpression(filter: string): void {
+  if (filter.length > MAX_FILTER_LENGTH) {
+    throw new Error('valkey: filter expression too long');
+  }
   if (FILTER_DISALLOWED_PATTERN.test(filter)) {
     throw new Error(
       'valkey: filter expression contains disallowed characters. ' +
