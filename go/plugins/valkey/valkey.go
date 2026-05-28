@@ -32,6 +32,7 @@ import (
 	"sync"
 
 	"github.com/firebase/genkit/go/ai"
+	"github.com/firebase/genkit/go/core"
 	"github.com/firebase/genkit/go/core/api"
 	"github.com/firebase/genkit/go/genkit"
 	glide "github.com/valkey-io/valkey-glide/go/v2"
@@ -161,12 +162,16 @@ type Docstore struct {
 	MetadataFields  []MetadataFieldConfig
 }
 
-// DefineRetriever defines a Retriever backed by Valkey vector search.
-// It ensures the FT index exists and registers the retriever action.
-//
-// Note: The Go Genkit SDK does not currently provide a DefineIndexer API.
-// Use the returned Docstore's Index method directly for indexing documents.
-// See the localvec and weaviate plugins for the same pattern.
+// IndexerRequest is the input type for the indexer action.
+type IndexerRequest struct {
+	Documents []*ai.Document `json:"documents"`
+}
+
+// IndexerResponse is the output type for the indexer action (empty on success).
+type IndexerResponse struct{}
+
+// DefineRetriever defines a Retriever and Indexer backed by Valkey vector search.
+// It ensures the FT index exists and registers both actions with the Genkit registry.
 func DefineRetriever(ctx context.Context, g *genkit.Genkit, cfg Config, opts *ai.RetrieverOptions) (*Docstore, ai.Retriever, error) {
 	plugin := genkit.LookupPlugin(g, provider)
 	if plugin == nil {
@@ -178,6 +183,28 @@ func DefineRetriever(ctx context.Context, g *genkit.Genkit, cfg Config, opts *ai
 	if err != nil {
 		return nil, nil, err
 	}
+
+	// Register the indexer action so it appears in the Genkit Dev UI and can
+	// be invoked via the reflection API, matching JS and Python behaviour.
+	indexerAction := core.NewAction(
+		api.NewName(provider, cfg.IndexName),
+		api.ActionTypeIndexer,
+		map[string]any{
+			"type": api.ActionTypeIndexer,
+			"indexer": map[string]any{
+				"label": fmt.Sprintf("Valkey - %s", cfg.IndexName),
+			},
+		},
+		nil,
+		func(ctx context.Context, req *IndexerRequest) (*IndexerResponse, error) {
+			if err := ds.Index(ctx, req.Documents); err != nil {
+				return nil, err
+			}
+			return &IndexerResponse{}, nil
+		},
+	)
+	genkit.RegisterAction(g, indexerAction)
+
 	return ds, genkit.DefineRetriever(g, api.NewName(provider, cfg.IndexName), opts, ds.Retrieve), nil
 }
 
@@ -304,7 +331,19 @@ func (ds *Docstore) Index(ctx context.Context, docs []*ai.Document) error {
 
 	// Build all HSet commands into a non-atomic batch (pipeline) and execute
 	// in a single round-trip.
-	batch := pipeline.NewStandaloneBatch(false)
+	// Note: NewStandaloneBatch works only with glide.Client (standalone mode).
+	// Cluster deployments require GlideClusterClient + pipeline.NewClusterBatch,
+	// which is planned for a future release.
+	//
+	// Large document sets are chunked into batches of indexBatchSize to avoid
+	// unbounded pipeline sizes that could cause OOM or timeouts.
+	const indexBatchSize = 1000
+
+	type docEntry struct {
+		key    string
+		fields map[string]string
+	}
+	entries := make([]docEntry, 0, len(docs))
 
 	for i, de := range eres.Embeddings {
 		doc := docs[i]
@@ -342,12 +381,22 @@ func (ds *Docstore) Index(ctx context.Context, docs []*ai.Document) error {
 			}
 		}
 
-		batch.HSet(key, fields)
+		entries = append(entries, docEntry{key: key, fields: fields})
 	}
 
-	_, err = ds.Client.Exec(ctx, *batch, true)
-	if err != nil {
-		return fmt.Errorf("valkey: batch index failed: %w", err)
+	for start := 0; start < len(entries); start += indexBatchSize {
+		end := min(start+indexBatchSize, len(entries))
+		chunk := entries[start:end]
+
+		batch := pipeline.NewStandaloneBatch(false)
+		for _, e := range chunk {
+			batch.HSet(e.key, e.fields)
+		}
+
+		results, err := ds.Client.Exec(ctx, *batch, true)
+		if err != nil {
+			return fmt.Errorf("valkey: batch index failed (%d/%d commands executed, chunk offset %d): %w", len(results), len(chunk), start, err)
+		}
 	}
 
 	return nil

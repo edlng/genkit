@@ -135,7 +135,7 @@ def _doc_id(doc: Document) -> str:
         'dataType': doc.data_type or 'text',
         'metadata': doc.metadata,
     }
-    serialized = json.dumps(canonical, sort_keys=True)
+    serialized = json.dumps(canonical, sort_keys=True, separators=(',', ':'))
     return hashlib.md5(serialized.encode()).hexdigest()
 
 
@@ -270,7 +270,11 @@ class Valkey(Plugin):
                         f'valkey: embedder returned {len(embedding)}-dim vector, expected {cfg.dimension}'
                     )
 
-            batch = Batch(is_atomic=False)
+            # Chunk documents into batches to avoid unbounded pipeline sizes
+            # that could cause OOM or timeouts with very large inputs.
+            _INDEX_BATCH_SIZE = 1000
+
+            entries: list[tuple[str, dict[str, bytes | str]]] = []
             for i, doc in enumerate(req.documents):
                 embedding = embed_response.embeddings[i].embedding
                 vec_bytes = _float32_to_bytes(embedding)
@@ -302,9 +306,14 @@ class Valkey(Plugin):
                             else:
                                 fields[mf.name] = str(val)
 
-                batch.hset(key, fields)
+                entries.append((key, fields))
 
-            await client.exec(batch, raise_on_error=True)
+            for start in range(0, len(entries), _INDEX_BATCH_SIZE):
+                chunk = entries[start:start + _INDEX_BATCH_SIZE]
+                batch = Batch(is_atomic=False)
+                for key, fields in chunk:
+                    batch.hset(key, fields)
+                await client.exec(batch, raise_on_error=True)
 
             return IndexerResponse()
 

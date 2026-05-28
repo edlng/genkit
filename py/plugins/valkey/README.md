@@ -16,6 +16,11 @@ pip install genkit-plugin-valkey
 - Valkey 8+ with the valkey-search module
 - Python 3.11+
 
+## Limitations
+
+- **Standalone mode only**: This plugin uses `GlideClient` (standalone). Cluster
+  deployments (`GlideClusterClient`) are not yet supported.
+
 ## Usage
 
 ```python

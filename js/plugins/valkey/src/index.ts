@@ -242,9 +242,12 @@ function configureValkeyIndexer<EmbedderCustomOptions extends z.ZodTypeAny>(
       });
       const allEmbeddings = response.embeddings;
 
-      // Build all hset operations into a non-atomic batch (pipeline) and
-      // execute in a single round-trip.
-      const batch = new Batch(false);
+      // Collect all hset entries, then chunk into batches of INDEX_BATCH_SIZE
+      // to avoid unbounded pipeline sizes that could cause OOM or timeouts.
+      const INDEX_BATCH_SIZE = 1000;
+
+      type HSetEntry = { key: string; fields: Record<string, string | Buffer> };
+      const entries: HSetEntry[] = [];
 
       for (let i = 0; i < docs.length; i++) {
         const doc = docs[i];
@@ -287,11 +290,18 @@ function configureValkeyIndexer<EmbedderCustomOptions extends z.ZodTypeAny>(
             }
           }
 
-          batch.hset(`${prefix}:${id}`, fields);
+          entries.push({ key: `${prefix}:${id}`, fields });
         }
       }
 
-      await client.exec(batch, true);
+      for (let start = 0; start < entries.length; start += INDEX_BATCH_SIZE) {
+        const chunk = entries.slice(start, start + INDEX_BATCH_SIZE);
+        const batch = new Batch(false);
+        for (const entry of chunk) {
+          batch.hset(entry.key, entry.fields);
+        }
+        await client.exec(batch, true);
+      }
     }
   );
 }

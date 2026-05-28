@@ -536,6 +536,13 @@ describe('stableDocId', () => {
     const idNoMeta = stableDocId({ data: 'hello', metadata: {}, dataType: 'text' });
     expect(idWithMeta).not.toBe(idNoMeta);
   });
+
+  test('cross-language test vector matches Go and Python', () => {
+    // Canonical JSON: {"data":"hello","dataType":"text","metadata":null}
+    // MD5: 3c04c6b9f04e5e522404b4c567ad09b0
+    const id = stableDocId({ data: 'hello', dataType: 'text' });
+    expect(id).toBe('3c04c6b9f04e5e522404b4c567ad09b0');
+  });
 });
 
 describe('validateFilterExpression', () => {

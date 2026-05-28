@@ -129,3 +129,15 @@ async def _run_index_and_retrieve() -> None:
 def test_index_and_retrieve():
     """Test indexing documents and retrieving them via KNN search."""
     asyncio.run(_run_index_and_retrieve())
+
+
+def test_doc_id_cross_language_vector():
+    """Cross-language test vector: must match Go and JS implementations.
+
+    Canonical JSON: {"data":"hello","dataType":"text","metadata":null}
+    MD5: 3c04c6b9f04e5e522404b4c567ad09b0
+    """
+    from genkit.plugins.valkey.plugin import _doc_id
+
+    doc = Document.from_text('hello')
+    assert _doc_id(doc) == '3c04c6b9f04e5e522404b4c567ad09b0'
